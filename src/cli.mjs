@@ -1,23 +1,23 @@
 import {loadConfig} from './config.mjs';
-import {Worker} from './worker.mjs';
-import {finalizeVerified} from './recovery.mjs';
+import {Runtime} from './runtime.mjs';
 import {serve} from './server.mjs';
+import {acquireLease} from './lease.mjs';
 
-const args=process.argv.slice(2),command=args[0];
-const configAt=args.indexOf('--config');
-const config=await loadConfig(configAt<0?undefined:args[configAt+1]);
-const worker=new Worker(config);
+const args=process.argv.slice(2),configAt=args.indexOf('--config');
+const config=await loadConfig(configAt<0?undefined:args[configAt+1]),runtime=new Runtime(config);
+let release;
 try {
-  if(command==='status') console.log(JSON.stringify(await worker.state(),null,2));
-  else if(command==='serve') {await serve(worker);await new Promise(()=>{});}
+  if(args[0]==='status')console.log(JSON.stringify(await runtime.state(),null,2));
   else {
-    await worker.connect();
-    if(command==='scan') console.log(JSON.stringify(await worker.scan(),null,2));
-    else if(command==='run'||command==='retry') {
-      const result=await worker.run(args[1],args[2],{retry:command==='retry'});console.log(JSON.stringify(result,null,2));
-      if(!['completed','not-triggered'].includes(result.status))process.exitCode=1;
-    } else if(command==='finalize') console.log(JSON.stringify(await finalizeVerified(worker,args[1],args[2]),null,2));
-    else throw Error('Usage: scan | status | run RULE REM | retry RULE REM | finalize RULE REM | serve [--config PATH]');
+    if(['serve','scan'].includes(args[0]))release=await acquireLease(config.dataRoot);
+    if(args[0]==='serve') {
+      const service=await serve(runtime);console.log('RemNote Tag Actions ready on loopback port '+service.server.address().port);
+      for(const sig of ['SIGINT','SIGTERM'])process.on(sig,async()=>{await service.close();await runtime.close();await release?.();release=null;process.exit(0);});
+      await new Promise(()=>{});
+    }else {
+      console.log(JSON.stringify({ready:await runtime.ready()}));
+      if(args[0]==='scan')console.log(JSON.stringify(await runtime.tick(),null,2));
+      else if(args[0]!=='check')throw Error('Usage: check | status | scan | serve [--config PATH]');
+    }
   }
-} catch(error) {console.error(error.message);process.exitCode=1;}
-finally {await worker.mcp?.close();}
+}catch(e){console.error(e.message);process.exitCode=1;}finally{await runtime.close();await release?.();}

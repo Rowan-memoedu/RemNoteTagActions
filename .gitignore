@@ -17,7 +17,6 @@ config.local.json
 *credentials*
 *cookie*
 *token*
-!tokens.css
 __pycache__/
 *.py[cod]
 .venv/

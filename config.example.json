@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "mcpUrl": "http://127.0.0.1:19782/mcp/remnote",
+  "dataRoot": "D:/AppData/RemNoteTagActions",
+  "artifactsRoot": "D:/Artifacts/RemNoteTagActions",
+  "workspace": "D:/Workspaces/新建文件夹",
+  "wakewireHome": "D:/AppData/WakeWire",
+  "appProjectId": "REPLACE_FROM_NATIVE_LIST_PROJECTS",
+  "appOwnerThreadId": "REPLACE_WITH_OWNER_THREAD",
+  "maxNodes": 500,
+  "pollMs": 15000,
+  "trashRemId": "REPLACE_WITH_ROOT_TRASH_REM",
+  "rules": [{
+    "id": "generate",
+    "label": "按要求生成",
+    "handler": "generation",
+    "enabled": true,
+    "triggerTagId": "REPLACE_WITH_GENERATING_REM_ID",
+    "triggerTagName": "Generating",
+    "completedTagId": "REPLACE_WITH_AI_GENERATED_REM_ID",
+    "completedTagName": "AI Generated",
+    "shortcut": "ctrl+shift+g"
+  }]
+}

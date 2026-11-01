@@ -2,7 +2,7 @@ import React,{useEffect,useState} from 'react';
 import {renderWidget,usePlugin} from '@remnote/plugin-sdk';
 import {request} from './api.mjs';
 import {trigger} from './action.mjs';
-import tokens from '../tokens.css';
+import tokens from '../theme.css';
 import css from './style.css';
 function Menu(){
   const plugin=usePlugin(),[actions,setActions]=useState([]),[capture,setCapture]=useState(null),[pending,setPending]=useState(null),[error,setError]=useState('');

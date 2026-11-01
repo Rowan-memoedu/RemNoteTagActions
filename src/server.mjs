@@ -1,103 +1,81 @@
 import http from 'node:http';
-import {readFile,mkdir} from 'node:fs/promises';
+import {readFile,mkdir,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
-import {randomBytes,timingSafeEqual} from 'node:crypto';
+import {randomBytes,randomUUID,timingSafeEqual} from 'node:crypto';
 import {jsonRead,jsonWrite,id} from './io.mjs';
 
-const corsOrigins=new Set(['null']);
-const hosts=new Set(['127.0.0.1','localhost','::1','[::1]']);
-const active=new Set(['capturing','generating','applying','content-verified','needs-review']);
 export function authorized(request,token) {
   const supplied=request.headers.authorization?.replace(/^Bearer /,'')??'';
-  return supplied.length===token.length&&timingSafeEqual(Buffer.from(supplied),Buffer.from(token));
+  const a=Buffer.from(supplied),b=Buffer.from(token);
+  return a.length===b.length&&timingSafeEqual(a,b);
 }
-export async function serve(worker,{port=worker.config.port??43171}={}) {
-  const {config}=worker;
-  await mkdir(config.dataRoot,{recursive:true});
+export function imageType(bytes) {
+  if(bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))return 'png';
+  if(bytes[0]===255&&bytes[1]===216&&bytes[2]===255)return 'jpg';
+  if(bytes.subarray(0,4).toString()==='RIFF'&&bytes.subarray(8,12).toString()==='WEBP')return 'webp';
+  throw Error('支持 PNG、JPEG、WebP 图片');
+}
+export async function serve(runtime,{port=runtime.config.port??43171,startPolling=true,ipv6=true}={}) {
+  const {config}=runtime;await mkdir(config.dataRoot,{recursive:true});
   const credentialsPath=join(config.dataRoot,'transport.json');
   let credentials=await jsonRead(credentialsPath,null);
   if(!credentials){credentials={token:randomBytes(32).toString('hex')};await jsonWrite(credentialsPath,credentials);}
-  const {token}=credentials,queue=new Map();let draining=false,lastScanError=null,pluginSeen=null;
-  async function drain() {
-    if(draining)return;draining=true;
+  const {token}=credentials;let busy=false,lastError=null;
+  async function tick(){if(busy)return;busy=true;try{if(!runtime.wakewire.routeId)await runtime.ready();await runtime.tick();lastError=null;}catch(e){lastError=e.message;runtime.log('bridge: '+e.message);}finally{busy=false;}}
+  const respond=(res,status,value,headers={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers});res.end(status===204?undefined:JSON.stringify(value));};
+  async function body(req) {
+    if(!req.headers['content-type']?.startsWith('application/json'))throw Error('JSON body required');
+    let size=0;const parts=[];for await(const chunk of req){size+=chunk.length;if(size>12*1024*1024)throw Error('Request too large');parts.push(chunk);}return JSON.parse(Buffer.concat(parts).toString('utf8'));
+  }
+  const handler=async(req,res)=>{
+    const origin=req.headers.origin,allowedOrigins=['null','http://localhost:'+port,'http://127.0.0.1:'+port,'http://[::1]:'+port];
+    const cors=allowedOrigins.includes(origin)?{'Access-Control-Allow-Origin':origin,'Vary':'Origin'}:{};
     try {
-      for(const [key,request] of queue) {
-        queue.delete(key);
-        try{await worker.run(request.ruleId,request.remId,{retry:request.retry});}
-        catch(error){worker.log(`request-held ${key}: ${error.message}`);}
+      const host=new URL('http://'+(req.headers.host??'')).hostname;
+      if(!['127.0.0.1','localhost','[::1]'].includes(host))return respond(res,403,{error:'Host rejected'});
+      const url=new URL(req.url,'http://localhost'),path=url.pathname,api=path.startsWith('/api/');
+      if(api&&origin&&!allowedOrigins.includes(origin))return respond(res,403,{error:'Origin rejected'});
+      if(api&&req.method==='OPTIONS')return respond(res,204,null,{...cors,'Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Authorization,Content-Type'});
+      if(path==='/health')return respond(res,200,{app:'RemNoteTagActions',version:'0.2.0',busy,bridgeError:lastError});
+      if(api&&!authorized(req,token))return respond(res,401,{error:'Unauthorized'},cors);
+      if(path==='/api/actions'&&req.method==='GET')return respond(res,200,{actions:config.rules.filter(r=>r.enabled!==false).map(r=>({id:r.id,label:r.label,triggerTagId:r.triggerTagId,shortcut:r.shortcut})),capabilities:runtime.capabilities},cors);
+      if(path==='/api/status'&&req.method==='GET')return respond(res,200,{...await runtime.state(),capabilities:runtime.capabilities,bridgeError:lastError},cors);
+      if(path==='/api/plugin'&&req.method==='POST')return respond(res,200,await runtime.pluginSeen(await body(req)),cors);
+      if(path==='/api/request'&&req.method==='POST')return respond(res,202,await runtime.submitRule(await body(req)),cors);
+      if(path==='/api/chats'&&req.method==='POST')return respond(res,202,await runtime.chat(await body(req)),cors);
+      if(path==='/api/attachments'&&req.method==='POST') {
+        const data=await body(req);await runtime.checkKb(data.kbId);
+        if(typeof data.base64!=='string'||!data.base64.length||data.base64.length>11200000||!/^[A-Za-z0-9+/]*={0,2}$/.test(data.base64))throw Error('Invalid image data');
+        const bytes=Buffer.from(data.base64,'base64');if(bytes.length>8*1024*1024)throw Error('每张图片不超过 8 MB');
+        const ext=imageType(bytes),imageId=randomUUID(),dir=join(config.dataRoot,'attachments');await mkdir(dir,{recursive:true});
+        const metadata={id:imageId,name:String(data.name??'图片').slice(0,120),path:join(dir,imageId+'.'+ext),size:bytes.length,createdAt:new Date().toISOString()};
+        await writeFile(metadata.path,bytes,{flag:'wx'});await jsonWrite(join(dir,imageId+'.json'),metadata);
+        return respond(res,201,{id:imageId,name:metadata.name,size:metadata.size},cors);
       }
-    } finally {draining=false;}
-  }
-  async function scan() {
-    if(draining)return;
-    try {for(const match of await worker.scan())queue.set(`${match.ruleId}:${match.remId}`,{...match,retry:false});lastScanError=null;}
-    catch(error){lastScanError=error.message;worker.log(`scan-error: ${error.message}`);await worker.mcp?.close().catch(()=>{});worker.mcp=undefined;}
-    void drain();
-  }
-  function respond(response,status,value,headers={}) {
-    response.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers});response.end(JSON.stringify(value));
-  }
-  async function body(request) {
-    if(!request.headers['content-type']?.startsWith('application/json'))throw Error('JSON body required');
-    let content='';for await(const chunk of request){content+=chunk;if(content.length>20000)throw Error('Request too large');}
-    return JSON.parse(content);
-  }
-  const server=http.createServer(async(request,response)=>{
-    try {
-      const origin=request.headers.origin;
-      const host=new URL(`http://${request.headers.host??''}`).hostname;
-      if(!hosts.has(host))return respond(response,403,{error:'Host rejected'});
-      const path=new URL(request.url,'http://localhost').pathname;
-      const api=path.startsWith('/api/');
-      const cors=origin&&corsOrigins.has(origin)?{'Access-Control-Allow-Origin':origin,'Vary':'Origin'}:{};
-      if(api&&origin&&!corsOrigins.has(origin))return respond(response,403,{error:'Origin rejected'});
-      if(api&&request.method==='OPTIONS')return respond(response,204,null,{...cors,'Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Authorization,Content-Type'});
-      if(path==='/health')return respond(response,200,{app:'RemNoteTagActions',version:'0.1.0',busy:draining,queued:queue.size,bridgeError:lastScanError,pluginConnected:pluginSeen&&Date.now()-pluginSeen.at<60000});
-      if(api&&!authorized(request,token))return respond(response,401,{error:'Unauthorized'},cors);
-      if(path==='/api/actions'&&request.method==='GET')return respond(response,200,{actions:config.rules.filter(r=>r.enabled!==false).map(r=>({id:r.id,label:r.label,triggerTagId:r.triggerTagId,shortcut:r.shortcut}))},cors);
-      if(path==='/api/status'&&request.method==='GET')return respond(response,200,{...await worker.state(),queued:[...queue.values()],pluginSeen},cors);
-      if(path==='/api/plugin'&&request.method==='POST') {
-        const data=await body(request);
-        pluginSeen={at:Date.now(),version:String(data.version??''),commands:Array.isArray(data.commands)?data.commands.slice(0,50):[],headerRegistered:data.headerRegistered===true,kbId:String(data.kbId??'')};
-        return respond(response,200,{ok:true},cors);
+      const chat=path.match(/^\/api\/chats\/([\w-]+)(?:\/(messages|fork))?$/);
+      if(chat){
+        if(!chat[2]&&req.method==='GET')return respond(res,200,await runtime.thread(chat[1],url.searchParams.get('cursor')),cors);
+        if(chat[2]==='messages'&&req.method==='POST')return respond(res,202,await runtime.followup(chat[1],await body(req)),cors);
+        if(chat[2]==='fork'&&req.method==='POST')return respond(res,202,await runtime.fork(chat[1],await body(req)),cors);
       }
-      if(path==='/api/request'&&request.method==='POST') {
-        const data=await body(request),rule=worker.rule(data.ruleId);
-        if(!Array.isArray(data.remIds)||!data.remIds.length||data.remIds.length>50||data.remIds.some(r=>!id(r)))throw Error('Choose 1–50 valid Rems');
-        await worker.checkTags(rule);
-        const selected=[...new Set(data.remIds)],notes=[];
-        for(const remId of selected)notes.push(await worker.mcp.read(remId));
-        const roots=notes.filter(n=>!n.ancestors?.some(a=>selected.includes(a.remId)));
-        const state=await worker.state(),accepted=[];
-        for(const note of roots) {
-          if([rule.triggerTagId,rule.completedTagId,config.trashRemId].includes(note.remId))throw Error('Cannot process a workflow tag or trash');
-          const key=`${rule.id}:${note.remId}`,prior=state.entries[key];
-          if(prior&&active.has(prior.status)){accepted.push({remId:note.remId,status:prior.status,jobId:prior.jobId});continue;}
-          await worker.mcp.call('remnote_update_tags',{remId:note.remId,addTagRemIds:[rule.triggerTagId],removeTagRemIds:[rule.completedTagId]});
-          const fresh=await worker.mcp.read(note.remId);
-          if(!fresh.tags?.some(t=>t.tagRemId===rule.triggerTagId))throw Error('Trigger tag readback failed');
-          queue.set(key,{ruleId:rule.id,remId:note.remId,retry:true});accepted.push({remId:note.remId,status:'queued'});
-        }
-        respond(response,202,{accepted},cors);void drain();return;
-      }
-      if(api)return respond(response,404,{error:'Unknown API route'},cors);
-      const files={'/':'index.html','/index.html':'index.html','/manifest.json':'manifest.json','/index.js':'index.js','/header.js':'header.js','/menu.js':'menu.js','/icon.svg':'icon.svg'};
-      if(request.method!=='GET'||!files[path])return respond(response,404,{error:'Not found'});
+      if(api)return respond(res,404,{error:'Unknown API route'},cors);
+      const files={'/':'index.html','/index.html':'index.html','/manifest.json':'manifest.json','/index.js':'index.js','/header.js':'header.js','/menu.js':'menu.js','/sidebar.js':'sidebar.js','/icon.svg':'icon.svg','/chat.svg':'chat.svg'};
+      if(req.method!=='GET'||!files[path])return respond(res,404,{error:'Not found'});
       const file=files[path],html=file.endsWith('.html');
-      if(html&&request.headers['sec-fetch-dest']!=='iframe')return respond(response,403,{error:'Plugin frame navigation required'});
+      if(html&&req.headers['sec-fetch-dest']!=='iframe')return respond(res,403,{error:'Plugin frame navigation required'});
       let data=await readFile(join(config.artifactsRoot,'plugin',file));
-      if(html)data=Buffer.from(data.toString().replace('<!--LOCAL_BOOTSTRAP-->',`<script>globalThis.__RNTA_TOKEN=${JSON.stringify(token)};globalThis.__RNTA_ORIGIN=${JSON.stringify(`http://127.0.0.1:${port}`)};</script>`));
+      if(html)data=Buffer.from(data.toString().replace('<!--LOCAL_BOOTSTRAP-->',`<script>globalThis.__RNTA_TOKEN=${JSON.stringify(token)};globalThis.__RNTA_ORIGIN=${JSON.stringify('http://127.0.0.1:'+port)};</script>`));
       const type=html?'text/html':file.endsWith('.js')?'application/javascript':file.endsWith('.svg')?'image/svg+xml':'application/json';
-      const headers={'Content-Type':`${type}; charset=utf-8`,'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'};
+      const headers={'Content-Type':type+'; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'};
       if(html)headers['Content-Security-Policy']="frame-ancestors https://*.remnote.com https://remnote.com; object-src 'none'; base-uri 'none'";
       else headers['Access-Control-Allow-Origin']='*';
-      response.writeHead(200,headers);response.end(data);
-    } catch(error){respond(response,error.code==='ENOENT'?404:400,{error:error.message},request.headers.origin==='null'?{'Access-Control-Allow-Origin':'null','Vary':'Origin'}:{});}
-  });
-  await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});
-  port=server.address().port;
-  const timer=setInterval(()=>void scan(),config.pollMs);void scan();
-  await jsonWrite(join(config.dataRoot,'service.json'),{pid:process.pid,port,startedAt:new Date().toISOString(),origin:`http://127.0.0.1:${port}`});
-  worker.log(`service-ready http://127.0.0.1:${port}`);
-  return {server,close:async()=>{clearInterval(timer);await new Promise(resolve=>server.close(resolve));}};
+      res.writeHead(200,headers);res.end(data);
+    }catch(e){respond(res,e.code==='ENOENT'?404:400,{error:e.message},cors);}
+  };
+  const server=http.createServer(handler);await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});port=server.address().port;
+  let server6;
+  if(ipv6){server6=http.createServer(handler);try{await new Promise((resolve,reject)=>{server6.once('error',reject);server6.listen(port,'::1',resolve);});}catch(e){server.close();throw e;}}
+  const timer=startPolling?setInterval(()=>void tick(),config.pollMs):null;if(startPolling)void tick();
+  await jsonWrite(join(config.dataRoot,'service.json'),{pid:process.pid,port,startedAt:new Date().toISOString(),version:'0.2.0'});
+  return {server,close:async()=>{clearInterval(timer);await Promise.all([server,server6].filter(Boolean).map(s=>new Promise(r=>s.close(r))));}};
 }

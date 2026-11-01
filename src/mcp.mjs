@@ -5,11 +5,13 @@ export class RemNote {
   constructor(url) { this.url=url; }
   async connect() {
     this.client = new Client({name:'remnote-tag-actions',version:'0.1.0'});
-    await this.client.connect(new StreamableHTTPClientTransport(new URL(this.url)));
-    const status = await this.call('remnote_status');
-    if(!status.connected) throw Error('RemNote bridge is disconnected');
-    if(!status.acceptWriteOperations) throw Error('RemNote writes are disabled');
-    return this;
+    try {
+      await this.client.connect(new StreamableHTTPClientTransport(new URL(this.url)));
+      const status = await this.call('remnote_status');
+      if(!status.connected) throw Error('RemNote bridge is disconnected');
+      if(!status.acceptWriteOperations) throw Error('RemNote writes are disabled');
+      return this;
+    }catch(e){await this.close().catch(()=>{});throw e;}
   }
   async call(name,args={}) {
     const r=await this.client.callTool({name,arguments:args},undefined,{timeout:130000});
