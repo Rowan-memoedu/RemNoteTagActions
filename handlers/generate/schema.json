@@ -1,0 +1,13 @@
+{
+  "type":"object","additionalProperties":false,
+  "required":["status","reason","readRemIds","updates","creates","archives","evidence"],
+  "properties":{
+    "status":{"type":"string","enum":["ready","blocked"]},
+    "reason":{"type":"string"},
+    "readRemIds":{"type":"array","items":{"type":"string"}},
+    "updates":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["remId","title"],"properties":{"remId":{"type":"string"},"title":{"type":"string"}}}},
+    "creates":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["key","parentRef","title"],"properties":{"key":{"type":"string"},"parentRef":{"type":"string"},"title":{"type":"string"}}}},
+    "archives":{"type":"array","items":{"type":"string"}},
+    "evidence":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["claim","source"],"properties":{"claim":{"type":"string"},"source":{"type":"string"}}}}
+  }
+}

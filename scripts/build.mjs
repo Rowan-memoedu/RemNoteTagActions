@@ -1,0 +1,12 @@
+import {mkdir,readFile,copyFile,writeFile} from 'node:fs/promises';
+import {join} from 'node:path';
+import {build} from 'esbuild';
+import {loadConfig} from '../src/config.mjs';
+const config=await loadConfig(),output=join(config.artifactsRoot,'plugin');
+await mkdir(output,{recursive:true});
+for(const name of ['index','header','menu'])await build({entryPoints:[`plugin/${name}.jsx`],outfile:join(output,`${name}.js`),bundle:true,minify:true,format:'iife',platform:'browser',target:'es2020',loader:{'.css':'text'},define:{'process.env.NODE_ENV':'"production"'}});
+for(const name of ['manifest.json','index.html','icon.svg'])await copyFile(`plugin/${name}`,join(output,name));
+const tokenCss=await readFile('tokens.css','utf8'),css=await readFile('plugin/style.css','utf8'),icon=await readFile('plugin/icon.svg','utf8');
+const states=['default','hover','focus','active','disabled','loading','error','success'];
+await writeFile(join(config.artifactsRoot,'Toolbar.preview.html'),`<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>标签处理按钮</title><style>${tokenCss}${css}body{background:var(--color-paper);color:var(--color-ink);padding:16px}section{display:flex;align-items:center;gap:24px;margin:12px 0}span{width:100px}</style>${states.map(s=>`<section><span>${s}</span><button class="action-button is-${s}" data-state="${s}" aria-label="标签处理 ${s}" ${s==='disabled'?'disabled':''}>${s==='success'?'✓':s==='error'?'!':icon}</button></section>`).join('')}</html>`);
+console.log(`Built ${output}`);

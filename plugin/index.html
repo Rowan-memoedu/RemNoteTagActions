@@ -1,0 +1,4 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RemNote Tag Actions</title></head><body><!--LOCAL_BOOTSTRAP--><script type="module">
+const name=new URLSearchParams(location.search).get('widgetName');
+if(['index','header','menu'].includes(name)){const script=document.createElement('script');script.type='module';script.src=name+'.js';document.body.append(script);}
+</script></body></html>
