@@ -40,7 +40,7 @@ SOFTWARE.
 
 Source: https://github.com/Rowan-memoedu/WakeWire (local commit 5f2ff8a).
 
-Adapted official app-tools MCP connection setup from src/workflows/native-project.ts into src/native.mjs. New Thread creation remains owned by the existing WakeWire daemon and its native adapter. No fork of the daemon is included.
+Adapted the authenticated native session handshake and JSON-RPC transport from src/cli/codex-session.ts and src/sinks/jsonrpc.ts into src/wakewire.mjs. The existing daemon owns each workflow connection's native App Server. The plugin invokes the official native protocol without another chat as an intermediary. No fork of the daemon is included.
 
 MIT License
 

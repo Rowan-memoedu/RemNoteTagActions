@@ -1,80 +1,121 @@
-// Connection logic adapted from WakeWire native-project.ts (MIT), commit 5f2ff8a.
-// All Thread state remains owned by the installed official app-tools server.
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import {Client} from '@modelcontextprotocol/sdk/client/index.js';
-import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
+import {WakeWireSession} from './wakewire.mjs';
 
+const samePath=(a,b)=>path.resolve(a??'').toLowerCase()===path.resolve(b??'').toLowerCase();
 export class NativeThreads {
-  constructor(config) {this.config=config;}
-  async connect() {
-    if(this.client)return;
-    if(this.connecting)return this.connecting;
-    this.connecting=(async()=>{
-      const root=path.join(process.env.CODEX_HOME??path.join(os.homedir(),'.codex'),'plugins/cache/openai-bundled/codex-app-tools');
-      const servers=fs.readdirSync(root,{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>path.join(root,e.name,'server.mjs')).filter(f=>fs.existsSync(f)).sort((a,b)=>fs.statSync(b).mtimeMs-fs.statSync(a).mtimeMs);
-      if(!servers[0])throw Error('Official Codex app-tools server is not installed');
-      let pipe=process.env.CODEX_APP_TOOLS_PIPE_PATH;
-      if(!pipe){const names=fs.readdirSync('\\\\.\\pipe\\').filter(n=>n.startsWith('codex-app-tools-'));if(names.length!==1)throw Error('需要一个正在运行的 ChatGPT 桌面端中的 Codex');pipe='\\\\.\\pipe\\'+names[0];}
-      const client=new Client({name:'remnote-tag-actions-native',version:'0.2.0'});
-      const env=Object.fromEntries(Object.entries(process.env).filter(([,v])=>v!==undefined));
-      try {
-        await client.connect(new StdioClientTransport({command:process.execPath,args:[servers[0]],env:{...env,CODEX_APP_TOOLS_PIPE_PATH:pipe},stderr:'ignore'}));
-        this.client=client;
-      } catch(e){await client.close().catch(()=>{});throw e;}
-    })();
-    try{await this.connecting;}finally{this.connecting=null;}
+  constructor(config,{sessionFactory=()=>new WakeWireSession(config)}={}) {
+    this.config=config;this.sessionFactory=sessionFactory;this.sessions=new Map();
   }
-  async call(name,args={}) {
-    await this.connect();
-    let r;try{r=await this.client.callTool({name,arguments:args,_meta:{'openai/threadId':this.config.appOwnerThreadId}},undefined,{timeout:60000});}
-    catch(e){await this.close().catch(()=>{});throw e;}
-    if(r.isError)throw Error(`原生 ${name} 调用失败：${r.content?.find(c=>c.type==='text')?.text??'unknown error'}`);
-    return r.structuredContent??JSON.parse(r.content.find(c=>c.type==='text').text);
+  async session() {
+    const session=await this.sessionFactory().connect();
+    session.onNotification=(method,params)=>{
+      if(method==='turn/started'){const entry=this.sessions.get(params.threadId);if(entry)entry.turnId=params.turn.id;}
+      if(method==='turn/completed'&&this.sessions.get(params.threadId)?.session===session)void this.finish(params.threadId,session);
+    };
+    return session;
   }
+  async using(fn) {const s=await this.session();try{return await fn(s);}finally{await s.close();}}
   async check() {
-    const r=await this.call('list_projects');
-    const p=r.projects.find(p=>p.projectId===this.config.appProjectId);
-    if(p?.hostId!=='local'||path.resolve(p.path??'').toLowerCase()!==path.resolve(this.config.workspace).toLowerCase())throw Error('Saved Project identity or workspace differs');
-    const tools=await this.client.listTools();
-    return {visible:true,followup:tools.tools.some(t=>t.name==='send_message_to_thread'),fork:tools.tools.some(t=>t.name==='fork_thread'),recover:true,images:'local-file',stop:false};
+    await this.using(async s=>{
+      const {project}=await s.request('project/read',{projectId:this.config.nativeProjectId});
+      if(!project.roots?.some(r=>samePath(r.path,this.config.workspace)))throw Error('Native Project identity or workspace differs');
+      const {config}=await s.request('config/read',{includeLayers:false}),permissions=this.config.nativePermissions;
+      if(permissions&&(config.approval_policy!==permissions.approvalPolicy||config.sandbox_mode!==permissions.sandbox))throw Error('原生会话未使用配置的完整访问策略');
+      for(const [server,mode] of Object.entries(permissions?.mcpServers??{}))if(config.mcp_servers?.[server]?.default_tools_approval_mode!==mode)throw Error('MCP 权限未生效：'+server);
+    });
+    return {visible:true,followup:true,fork:true,recover:true,images:'native',stop:true,origin:'independent-workflow'};
+  }
+  async create({title}={}) {
+    const s=await this.session();
+    try {
+      const r=await s.request('thread/start',{cwd:this.config.workspace,projectId:this.config.nativeProjectId,ephemeral:false,serviceName:'remnote_tag_actions',approvalPolicy:this.config.nativePermissions?.approvalPolicy,sandbox:this.config.nativePermissions?.sandbox});
+      this.sessions.set(r.thread.id,{session:s,title});return {threadId:r.thread.id};
+    }catch(e){await s.close();throw e;}
+  }
+  async send(threadId,prompt,{images=[],messageId}={}) {
+    let entry=this.sessions.get(threadId);
+    if(!entry?.session.alive) {
+      const s=await this.session();
+      try {await s.request('thread/resume',{threadId,excludeTurns:true,approvalPolicy:this.config.nativePermissions?.approvalPolicy,sandbox:this.config.nativePermissions?.sandbox});}
+      catch(e){await s.close();throw e;}
+      entry={session:s};this.sessions.set(threadId,entry);
+    }
+    try {
+      const r=await entry.session.request('turn/start',{threadId,clientUserMessageId:messageId,input:[{type:'text',text:prompt},...images.map(path=>({type:'localImage',path}))],turnTrigger:'remnote_tag_actions'});
+      entry.turnId=r.turn.id;
+      if(entry.title)try{await entry.session.request('thread/name/set',{threadId,name:entry.title});entry.title=null;}catch{/* Naming may precede the first durable history write; finish retries it. */}
+      return {threadId,turnId:r.turn.id};
+    }catch(e){if(!e.uncertain)await this.release(threadId,entry.session);throw e;}
+  }
+  async read(threadId,cursor) {
+    const read=async s=>{
+      const {thread}=await s.request('thread/read',{threadId,includeTurns:false});
+      const page=await s.request('thread/turns/list',{threadId,limit:10,itemsView:'full',sortDirection:'desc',...(cursor?{cursor}:{})});
+      return {thread,turns:page.data,page:{nextCursor:page.nextCursor,hasMore:!!page.nextCursor},pendingRequests:[...s.serverRequests.values()]};
+    };
+    const entry=this.sessions.get(threadId);
+    return entry?.session.alive?read(entry.session):this.using(read);
   }
   async visible(threadId) {
-    let cursor;const seen=new Set();
-    do {
-      const r=await this.call('list_threads',{mode:'history',source:'codex',hostId:'local',limit:50,...(cursor?{cursor}:{})});
-      const t=r.threads.find(t=>t.id===threadId);
-      if(t){if(t.projectId!==this.config.appProjectId||path.resolve(t.cwd??'').toLowerCase()!==path.resolve(this.config.workspace).toLowerCase())throw Error('Visible Thread project mismatch');return t;}
-      cursor=r.nextCursor;if(cursor&&seen.has(cursor))throw Error('Native pagination repeated');seen.add(cursor);
-    } while(cursor);
-    throw Error('Thread 尚未出现在原生列表中');
+    return this.using(async s=>{
+      const {thread}=await s.request('thread/read',{threadId,includeTurns:false});
+      const searchTerm=(thread.name??thread.preview??'').slice(0,60);
+      if(!searchTerm)throw Error('Thread 尚无持久消息，等待首次输入');
+      let cursor;const seen=new Set();
+      do {
+        const r=await s.request('thread/list',{cwd:thread.cwd,projectId:this.config.nativeProjectId,searchTerm,useStateDbOnly:true,limit:50,...(cursor?{cursor}:{})});
+        const t=r.data.find(t=>t.id===threadId);
+        if(t){if(t.projectId!==this.config.nativeProjectId||!samePath(t.cwd,this.config.workspace))throw Error('Native Thread project mismatch');return {...t,title:t.name??t.preview?.slice(0,60)};}
+        cursor=r.nextCursor;if(cursor&&seen.has(cursor))throw Error('Native pagination repeated');seen.add(cursor);
+      }while(cursor);
+      throw Error('Thread 尚未出现在原生历史列表中');
+    });
   }
-  read(threadId,cursor) {return this.call('read_thread',{threadId,hostId:'local',turnLimit:10,includeOutputs:true,maxOutputCharsPerItem:20000,...(cursor?{cursor}:{})});}
-  send(threadId,prompt) {return this.call('send_message_to_thread',{threadId,hostId:'local',prompt});}
-  fork(threadId) {return this.call('fork_thread',{threadId,environment:{type:'same-directory'}});}
-  async close() {await this.client?.close();this.client=null;}
+  async fork(threadId) {
+    return this.using(async s=>{
+      const r=await s.request('thread/fork',{threadId,cwd:this.config.workspace,ephemeral:false,excludeTurns:true,approvalPolicy:this.config.nativePermissions?.approvalPolicy,sandbox:this.config.nativePermissions?.sandbox});
+      return {threadId:r.thread.id};
+    });
+  }
+  async stop(threadId) {
+    const entry=this.sessions.get(threadId);
+    if(!entry?.session.alive||!entry.turnId)throw Error('本插件没有该回合的执行连接，请在正在运行它的 Codex 窗口停止');
+    await entry.session.request('turn/interrupt',{threadId,turnId:entry.turnId});
+    return {threadId,turnId:entry.turnId,status:'stopping'};
+  }
+  async respond(threadId,requestId,result) {
+    const session=this.sessions.get(threadId)?.session,request=session?.serverRequests.get(requestId);
+    if(!request||request.params?.threadId!==threadId)throw Error('原生请求不属于当前对话，或已失效');
+    if(request.method==='mcpServer/elicitation/request') {
+      if(!['accept','decline','cancel'].includes(result?.action))throw Error('Invalid elicitation action');
+      if(result.action==='accept'&&!['form','openai/form','openaiForm'].includes(request.params.mode))throw Error('该原生请求需要专用验证，不能在此确认');
+    }else if(['item/commandExecution/requestApproval','item/fileChange/requestApproval'].includes(request.method)) {
+      if(!['accept','decline','cancel'].includes(result?.decision))throw Error('Invalid native decision');
+    }else if(request.method==='item/tool/requestUserInput') {
+      if(!result?.answers||request.params.questions.some(q=>!Array.isArray(result.answers[q.id]?.answers)||!result.answers[q.id].answers.length))throw Error('请回答全部问题');
+    }else throw Error('此原生请求暂不支持在侧栏回复');
+    await session.respond(requestId,result);return {accepted:true};
+  }
+  async release(threadId,session) {if(this.sessions.get(threadId)?.session===session)this.sessions.delete(threadId);await session.close();}
+  async finish(threadId,session) {
+    const entry=this.sessions.get(threadId);
+    try{if(entry?.session===session&&entry.title)await session.request('thread/name/set',{threadId,name:entry.title});}
+    catch{/* A naming error must not retain the writer or replay the turn. */}
+    finally{await this.release(threadId,session);}
+  }
+  async close() {await Promise.all([...this.sessions.values()].map(e=>e.session.close()));this.sessions.clear();}
 }
 
-// Only render user-visible messages, not reasoning, tool arguments or shell output.
+// Render actual native messages only. Delegation tool outputs are not user input.
 export function messagesFromNative(snapshot) {
   return [...(snapshot.turns??[])].reverse().flatMap(turn=>(turn.items??[]).flatMap(item=>{
     if(item.type==='agentMessage')return [{id:item.id,role:'assistant',content:item.text??'',phase:item.phase,turnId:turn.id}];
     const input=inputFromNative(item);
-    if(input!==null)return [{id:item.id,role:'user',content:input,turnId:turn.id,truncated:!!item.output?.truncated}];
+    if(input!==null)return [{id:item.id,role:'user',content:input,turnId:turn.id,images:(item.content??[]).filter(c=>['image','localImage'].includes(c.type)).length}];
     return [];
   }));
 }
-
 export function inputFromNative(item) {
-  if(item.type==='userMessage')return (item.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n');
-  // Native cross-Thread prompts arrive as official codex_app function outputs.
-  if(item.type!=='functionCallOutput'||item.namespace!=='codex_app'||!['create_thread','send_message_to_thread'].includes(item.name))return null;
-  const text=item.output?.text;
-  if(typeof text!=='string'||!text.startsWith('<codex_delegation>'))return null;
-  const start=text.indexOf('<input>'),end=text.lastIndexOf('</input>');
-  if(start<0)return null;
-  if(end<start)return item.output?.truncated?text.slice(start+7)+'\n[消息较长，请在 Codex 中查看完整内容]':null;
-  return text.slice(start+7,end);
+  return item.type==='userMessage'?(item.content??[]).filter(c=>c.type==='text').map(c=>c.text).join('\n'):null;
 }
 export const promptIdentity=text=>String(text).replace(/\r\n/g,'\n').trimEnd();

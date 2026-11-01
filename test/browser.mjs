@@ -25,7 +25,8 @@ const url='http://127.0.0.1:'+server.address().port;
 const browser=await chromium.launch({channel:'msedge',headless:true});
 try {
   const context=await browser.newContext({viewport:{width:360,height:720}}),page=await context.newPage(),errors=[];page.on('pageerror',e=>errors.push(e.message));
-  const state={jobs:[],attempts:{},capabilities:{visible:true,followup:true,fork:true,recover:true,images:'local-file',stop:false}};
+  const state={jobs:[],attempts:{},capabilities:{visible:true,followup:true,fork:true,recover:true,images:'native',stop:true}};
+  let active=false,approval=null;
   const calls=[];let failFirst=true;
   await page.route('http://127.0.0.1:43171/**',async route=>{
     const r=route.request(),path=new URL(r.url()).pathname,data=r.postDataJSON();
@@ -42,7 +43,9 @@ try {
       calls.push({path,data});result={requestId:data.requestId,status:'accepted'};state.attempts[data.requestId]=result;
     } else if(path.endsWith('/fork')) {
       calls.push({path,data});const job={id:'job2',requestId:data.requestId,title:'整理节点内容 · 分叉',status:'ready',visible:true,threadId:'native2'};state.jobs.push(job);result={status:'accepted',childJobId:'job2'};
-    } else if(path.startsWith('/api/chats/'))result={job:state.jobs.find(j=>j.id===path.split('/').pop()),thread:{id:'native1',status:{type:'idle'}},turns:[{id:'turn1',status:'completed'}],messages:[{id:'u',role:'user',content:'整理选中的节点，保留原文。'},{id:'a',role:'assistant',content:'已读取节点上下文，保留原文并补全了说明。\n\n- 保留层级与引用\n- 写入后回读确认'}],page:{hasMore:false}};
+    } else if(path.endsWith('/responses')){calls.push({path,data});approval=null;result={accepted:true};}
+    else if(path.endsWith('/stop')){calls.push({path,data});active=false;result={status:'stopping'};}
+    else if(path.startsWith('/api/chats/'))result={job:state.jobs.find(j=>j.id===path.split('/').pop()),thread:{id:'native1',status:{type:active?'active':'idle'}},turns:[{id:'turn1',status:active?'inProgress':'completed'}],pendingRequests:approval?[approval]:[],messages:[{id:'u',role:'user',content:'整理选中的节点，保留原文。'},{id:'a',role:'assistant',content:'已读取节点上下文，保留原文并补全了说明。\n\n- 保留层级与引用\n- 写入后回读确认'}],page:{hasMore:false}};
     else return route.fulfill({status:404,body:'{}'});
     return route.fulfill({status:200,contentType:'application/json',headers:{'Access-Control-Allow-Origin':'*'},body:JSON.stringify(result)});
   });
@@ -54,9 +57,13 @@ try {
   await input.fill('补充一个例子');await page.getByRole('button',{name:'发送',exact:true}).click();await expect(input).toHaveValue('');assert.equal(calls.at(-1).path,'/api/chats/job1/messages');
   await input.fill('尚未发送的草稿');await expect.poll(()=>page.evaluate(()=>JSON.parse(localStorage.getItem('tag-actions.draft.job1')??'{}').text)).toBe('尚未发送的草稿');await page.reload();await expect(input).toHaveValue('尚未发送的草稿');
   await page.getByRole('button',{name:'分叉',exact:true}).click();await expect(page.getByRole('button',{name:/整理节点内容 · 分叉/})).toBeVisible();
+  active=true;approval={id:0,method:'mcpServer/elicitation/request',params:{threadId:'native2',mode:'form',message:'允许修改这个测试节点？',requestedSchema:{type:'object',properties:{}},_meta:{tool_params_display:[{name:'title',display_name:'修改后的内容',value:'仅修改测试节点 58127'}]}}};
+  await page.getByRole('button',{name:'恢复状态',exact:true}).click();await expect(page.getByText('仅修改测试节点 58127')).toBeVisible();assert.equal(calls.filter(c=>c.path.endsWith('/responses')).length,0);
+  await page.getByRole('button',{name:'确认本次',exact:true}).click();await expect(page.getByText('允许修改这个测试节点？')).toHaveCount(0);assert.deepEqual(calls.at(-1).data.result,{action:'accept',content:{}});
+  await page.getByRole('button',{name:'停止执行',exact:true}).click();await expect(page.getByRole('button',{name:'停止执行',exact:true})).toHaveCount(0);assert.equal(calls.at(-1).path,'/api/chats/job2/stop');
   await page.screenshot({path:join(output,'sidebar-light.png'),animations:'disabled'});await page.setViewportSize({width:320,height:640});await page.emulateMedia({colorScheme:'dark'});await page.screenshot({path:join(output,'sidebar-dark-320.png'),animations:'disabled'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
   const colors=await page.evaluate(()=>Object.fromEntries(['.chat-session-btn','.chat-input','.chat-container','.chat-markdown'].map(s=>{const c=getComputedStyle(document.querySelector(s));return [s,{color:c.color,background:c.backgroundColor,ink:c.getPropertyValue('--color-ink'),paper:c.getPropertyValue('--color-paper')}];})));await writeFile(join(output,'dark-colors.json'),JSON.stringify(colors,null,2));
   await page.goto(url+'?entry=header');await page.getByRole('button',{name:/按要求生成/}).click();await expect.poll(()=>calls.filter(c=>c.path==='/api/request').length).toBe(1);assert.deepEqual(calls.at(-1).data.remIds,['fixture-rem']);await page.getByRole('button',{name:'打开 RemNote 助手',exact:true}).click();await expect.poll(()=>page.evaluate(()=>window.sidebarOpened?.[0])).toBe('sidebar');
   await page.goto(url+'?entry=index');await page.evaluate(()=>window.indexReady);assert((await page.evaluate(()=>window.registeredWidgets)).some(w=>w[0]==='sidebar'&&w[1]==='RightSidebar'));assert((await page.evaluate(()=>window.registeredCommands.map(c=>({id:c.id,shortcut:c.keyboardShortcut})))).some(c=>c.shortcut==='ctrl+shift+g'));
-  assert.deepEqual(errors,[]);await writeFile(join(output,'result.json'),JSON.stringify({passed:true,checks:['IME enter guard','multiline','failed request keeps draft','same request retry','same Thread followup','draft survives reload','native fork selection','320px dark layout','exact selected node','sidebar icon','SDK sidebar and shortcut registration']}));console.log('Browser fixture: 11 checks passed. Screenshots: '+output);
+  assert.deepEqual(errors,[]);await writeFile(join(output,'result.json'),JSON.stringify({passed:true,checks:['IME enter guard','multiline','failed request keeps draft','same request retry','same Thread followup','draft survives reload','native fork selection','320px dark layout','exact selected node','sidebar icon','SDK sidebar and shortcut registration','native approval is visible and never automatic','native interrupt action']}));console.log('Browser fixture: 13 checks passed. Screenshots: '+output);
 }finally{await browser.close();await new Promise(r=>server.close(r));}

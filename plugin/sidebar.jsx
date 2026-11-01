@@ -6,23 +6,26 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {CodeBlock,SendIcon,TypingIndicator} from './upstream/chat-components';
 import {appendRawDraftSuffix} from './upstream/draft';
+import {NativeRequest} from './native-request';
 import {request} from './api.mjs';
 import upstreamCss from './upstream/chat.css';
 import css from './sidebar.css';
 import tokens from '../theme.css';
 
-const labels={preparing:'读取节点',queued:'正在建立 Thread','acceptance-unknown':'正在恢复投递',running:'执行中',ready:'可继续对话',forked:'已分叉，等待首条指令',completed:'内容已完成','awaiting-input':'等待补充','needs-attention':'需要处理'};
+const labels={preparing:'读取节点',creating:'正在建立对话',starting:'正在发送','creation-unknown':'创建结果待核对','acceptance-unknown':'发送结果待核对',running:'执行中',stopping:'正在停止',stopped:'已停止',ready:'可继续对话',forked:'已分叉，等待首条指令',completed:'内容已完成','awaiting-input':'等待补充','awaiting-approval':'等待确认','needs-attention':'需要处理'};
+const uncertain=status=>['creating','starting','creation-unknown','acceptance-unknown','unknown'].includes(status);
 function Sidebar() {
   const plugin=usePlugin(),[jobs,setJobs]=useState([]),[selected,setSelected]=useState(null),[messages,setMessages]=useState([]),[page,setPage]=useState({}),[text,setText]=useState(''),[files,setFiles]=useState([]),[error,setError]=useState(''),[connected,setConnected]=useState(false),[busy,setBusy]=useState(false),[pending,setPending]=useState(null),[context,setContext]=useState(null),[caps,setCaps]=useState({}),[menu,setMenu]=useState(false),[ready,setReady]=useState(false),[running,setRunning]=useState(false);
   const selectedRef=useRef(null),pendingRef=useRef(null),draftRef=useRef({text:'',files:[]}),alive=useRef(true),scroll=useRef(null),end=useRef(null),pinBottom=useRef(true),composing=useRef(false),fileInput=useRef(null),seq=useRef(0);
   selectedRef.current=selected;pendingRef.current=pending;draftRef.current={text,files};
+  const [nativeRequests,setNativeRequests]=useState([]);
   const draftKey=id=>'tag-actions.draft.'+(id??'new');
   async function choose(id) {
     if(pendingRef.current)throw Error('请先恢复上次发送状态');
     await plugin.storage.setLocal(draftKey(selectedRef.current),draftRef.current);
     const version=++seq.current,draft=await plugin.storage.getLocal(draftKey(id));
     if(version!==seq.current)return;
-    setText(appendRawDraftSuffix(draft?.text??'',''));setFiles(draft?.files??[]);setSelected(id);selectedRef.current=id;setMessages([]);setPage({});setMenu(false);setError('');pinBottom.current=true;
+    setText(appendRawDraftSuffix(draft?.text??'',''));setFiles(draft?.files??[]);setSelected(id);selectedRef.current=id;setMessages([]);setPage({});setNativeRequests([]);setRunning(false);setMenu(false);setError('');pinBottom.current=true;
     await plugin.storage.setLocal('tag-actions.selected',id);
   }
   async function accepted(p,jobId) {
@@ -33,6 +36,11 @@ function Sidebar() {
     if(jobId){setSelected(jobId);selectedRef.current=jobId;await plugin.storage.setLocal('tag-actions.selected',jobId);}
     setError('');
   }
+  async function rejected(p,jobId,message) {
+    pendingRef.current=null;setPending(null);await plugin.storage.setLocal('tag-actions.pending',null);
+    if(jobId){setSelected(jobId);selectedRef.current=jobId;await plugin.storage.setLocal('tag-actions.selected',jobId);}
+    setError(message??'发送失败，草稿已保留。');
+  }
   async function refresh() {
     try {
       const state=await request('/api/status');if(!alive.current)return;
@@ -40,13 +48,16 @@ function Sidebar() {
       if(state.bridgeError)setError(state.bridgeError);
       const p=pendingRef.current;
       if(p){const job=state.jobs.find(j=>j.requestId===p.requestId),attempt=state.attempts[p.requestId];
-        if(job)await accepted(p,job.id);
+        if(job&&uncertain(job.status))setError('结果尚未确认；保留草稿，只读取原生状态，不重复发送。');
+        else if(job?.status==='needs-attention')await rejected(p,job.id,job.error);
+        else if(job)await accepted(p,job.id);
         else if(attempt?.status==='accepted')await accepted(p,attempt.childJobId??p.jobId);
         else if(attempt?.status==='unknown')setError('发送结果尚未确认；保留草稿，请恢复读取，勿重复发送。');
+        else if(attempt?.status==='failed')await rejected(p,p.jobId,attempt.error);
       }
       const current=selectedRef.current;if(!current)return;
       const snapshot=await request('/api/chats/'+current);
-      if(alive.current&&selectedRef.current===current){setMessages(old=>mergeMessages(old,snapshot.messages));setPage(old=>old.loadedOlder?old:snapshot.page??{});setRunning(snapshot.turns?.some(t=>t.status==='inProgress')??false);}
+      if(alive.current&&selectedRef.current===current){setMessages(old=>mergeMessages(old,snapshot.messages));setPage(old=>old.loadedOlder?old:snapshot.page??{});setNativeRequests(snapshot.pendingRequests??[]);setRunning(snapshot.turns?.some(t=>t.status==='inProgress')??false);}
     }catch(e){if(alive.current){setConnected(false);setError(e.message);}}
   }
   useEffect(()=>{
@@ -68,7 +79,8 @@ function Sidebar() {
       const p=pendingRef.current??{requestId:crypto.randomUUID(),jobId:selected,text,files,kbId,context:context&&Date.now()-context.capturedAt<60000?context:null};
       pendingRef.current=p;setPending(p);await plugin.storage.setLocal('tag-actions.pending',p);
       const result=await request(p.jobId?'/api/chats/'+p.jobId+'/messages':'/api/chats',{...p,attachmentIds:p.files.map(f=>f.id)});
-      if(result.status==='unknown')setError('发送结果待确认，草稿已保留。点击恢复状态读取原 Thread。');
+      if(uncertain(result.status))setError('结果待确认，草稿已保留。点击恢复状态读取原 Thread。');
+      else if(['failed','needs-attention'].includes(result.status))await rejected(p,p.jobId??result.id,result.error);
       else await accepted(p,p.jobId??result.id);
       pinBottom.current=true;await refresh();
     }catch(e){setError(e.message+'；草稿和请求编号已保留。');}finally{setBusy(false);}
@@ -87,12 +99,22 @@ function Sidebar() {
       const p=pendingRef.current??{kind:'fork',requestId:crypto.randomUUID(),jobId:selected,text,files,kbId:(await plugin.kb.getCurrentKnowledgeBaseData())._id};
       pendingRef.current=p;setPending(p);await plugin.storage.setLocal('tag-actions.pending',p);
       const result=await request('/api/chats/'+p.jobId+'/fork',p);
-      if(result.childJobId)await accepted(p,result.childJobId);else throw Error('分叉结果未确认，原 Thread 已保留；请检查 Codex，不要重复点击');
+      if(result.childJobId)await accepted(p,result.childJobId);else if(result.status==='failed')await rejected(p,p.jobId,result.error);else throw Error('分叉结果未确认，原 Thread 已保留；请检查 Codex，不要重复点击');
       await refresh();
     }catch(e){setError(e.message);}finally{setBusy(false);}
   }
   async function older() {
     setBusy(true);try{const current=selected,s=await request('/api/chats/'+current+'?cursor='+encodeURIComponent(page.nextCursor));if(selectedRef.current===current){setMessages(old=>mergeMessages(s.messages,old));setPage({...s.page,loadedOlder:true});}}catch(e){setError(e.message);}finally{setBusy(false);}
+  }
+  async function stop() {
+    if(!selected||busy)return;setBusy(true);setError('');
+    try{const kbId=(await plugin.kb.getCurrentKnowledgeBaseData())._id;await request('/api/chats/'+selected+'/stop',{kbId});await refresh();}
+    catch(e){setError(e.message);}finally{setBusy(false);}
+  }
+  async function respond(nativeRequest,result) {
+    if(!selected||busy)return;setBusy(true);setError('');
+    try{const kbId=(await plugin.kb.getCurrentKnowledgeBaseData())._id;await request('/api/chats/'+selected+'/responses',{kbId,requestId:nativeRequest.id,result});await refresh();}
+    catch(e){setError(e.message);}finally{setBusy(false);}
   }
   const job=jobs.find(j=>j.id===selected),canSend=ready&&connected&&!busy&&!running&&(!!text.trim()||files.length>0||!!pending);
   return <><style>{tokens+upstreamCss+css}</style><div className="chat-container">
@@ -104,7 +126,8 @@ function Sidebar() {
       {page.hasMore&&<button className="load-older" disabled={busy} onClick={older}>加载较早消息</button>}
       {messages.length===0&&<div className="chat-empty-state">{job?'正在读取原生对话…':'输入你对知识库的要求。每个新对话会出现在 ChatGPT 桌面端中的 Codex。'}</div>}
       {messages.map(msg=><div key={msg.id} className={'chat-message chat-message--'+msg.role}><span className="chat-message-label">{msg.role==='user'?'你':'Codex'}</span>{msg.role==='user'?<div className="chat-bubble chat-bubble--user">{msg.content}</div>:<div className="chat-assistant-flow"><div className="chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{code:CodeBlock,img:({alt})=><span>[图片：{alt??''}]</span>,a:({href,children})=><a href={href} target="_blank" rel="noreferrer">{children}</a>}}>{msg.content}</ReactMarkdown></div></div>}</div>)}
-      {running&&<div className="working"><TypingIndicator/><span>正在执行；可在 Codex 中停止</span></div>}<div ref={end}/>
+      {nativeRequests.map(r=><NativeRequest key={selected+':'+r.id} request={r} onRespond={respond} busy={busy}/>)}
+      {running&&<div className="working"><TypingIndicator/><span>{nativeRequests.length?'等待你的答复':'正在执行'}</span>{caps.stop&&<button disabled={busy} onClick={stop} aria-label="停止执行">{busy?'正在停止…':'停止'}</button>}</div>}<div ref={end}/>
     </div>
     {files.length>0&&<div className="attachments">{files.map(f=><span key={f.id}>{f.name}<button disabled={!!pending||busy} aria-label={'移除 '+f.name} onClick={()=>setFiles(files.filter(x=>x.id!==f.id))}>×</button></span>)}</div>}
     {context?.remIds?.length>0&&<div className="selection-context">已附 {context.remIds.length} 个节点上下文<button onClick={()=>setContext(null)}>移除</button></div>}

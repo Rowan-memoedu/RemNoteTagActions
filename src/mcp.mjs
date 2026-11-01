@@ -4,7 +4,7 @@ import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/st
 export class RemNote {
   constructor(url) { this.url=url; }
   async connect() {
-    this.client = new Client({name:'remnote-tag-actions',version:'0.1.0'});
+    this.client = new Client({name:'remnote-tag-actions',version:'0.3.0'});
     try {
       await this.client.connect(new StreamableHTTPClientTransport(new URL(this.url)));
       const status = await this.call('remnote_status');

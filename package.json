@@ -1,6 +1,6 @@
 {
   "name": "remnote-tag-actions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -14,7 +14,8 @@
     "scan": "node src/cli.mjs scan"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.32.2"
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ws": "8.22.1"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",

@@ -7,13 +7,14 @@ import {verifyGeneration} from '../src/generation.mjs';
 import {messagesFromNative} from '../src/native.mjs';
 import {serve,imageType} from '../src/server.mjs';
 import {jsonRead,jsonWrite} from '../src/io.mjs';
+import {NativeRpcError} from '../src/wakewire.mjs';
 
 async function fixture() {
   const root=await mkdtemp('D:/Artifacts/RemNoteTagActions/test-');await mkdir(join(root,'plugin'));await writeFile(join(root,'plugin/index.html'),'<!--LOCAL_BOOTSTRAP-->');
   const notes={start:{remId:'start',title:'Start'},end:{remId:'end',title:'End'},root:{remId:'root',title:'Root',tags:[],ancestors:[]},child:{remId:'child',title:'Child',tags:[],ancestors:[{remId:'root'}]}};
   const writes=[],deliveries=new Map(),sends=[];let enqueueThrows=false,sendThrows=false;
   const config={dataRoot:join(root,'data'),artifactsRoot:root,rules:[{id:'any-rule',handler:'test-handler',triggerTagId:'start',triggerTagName:'Start',completedTagId:'end',completedTagName:'End'}],pollMs:60000};
-  const runtime=new Runtime(config,{log:()=>{},handlers:{'test-handler':{prepare:async()=> 'Read the original node',verify:async()=>({completed:false})}},mcp:{read:async id=>structuredClone(notes[id]),call:async(name,args)=>{writes.push(args);notes[args.remId].tags=[{tagRemId:args.addTagRemIds[0]}];},tagged:async()=>[notes.root]},wakewire:{enqueue:async(key,prompt)=>{if(enqueueThrows)throw Error('network uncertain');deliveries.set(key,{id:key,threadId:'native'});return deliveries.get(key);},delivery:async key=>deliveries.get(key)},native:{visible:async()=>({title:'Native title'}),read:async()=>({thread:{id:'native',status:{type:'idle'}},turns:[{id:'turn-1',status:'completed',items:[]}]}),send:async(...args)=>{sends.push(args);if(sendThrows)throw Error('unknown result');return {threadId:'native'};},close:async()=>{}}});
+  const runtime=new Runtime(config,{log:()=>{},handlers:{'test-handler':{prepare:async()=> 'Read the original node',verify:async()=>({completed:false})}},mcp:{read:async id=>structuredClone(notes[id]),call:async(name,args)=>{writes.push(args);notes[args.remId].tags=[{tagRemId:args.addTagRemIds[0]}];},tagged:async()=>[notes.root]},native:{check:async()=>({visible:true}),create:async()=>{deliveries.set(deliveries.size,{threadId:'native'});if(enqueueThrows)throw new NativeRpcError('creation uncertain',{uncertain:true});return {threadId:'native'};},visible:async()=>({title:'Native title'}),read:async()=>({thread:{id:'native',status:{type:'idle'}},turns:[{id:'turn-1',status:'completed',items:[]}]}),send:async(...args)=>{sends.push(args);assert.equal((await runtime.state()).jobs[0].threadId,'native');if(sendThrows)throw new NativeRpcError('unknown result',{uncertain:true});return {threadId:'native',turnId:'turn-1'};},close:async()=>{}}});
   return {runtime,root,notes,writes,deliveries,sends,setEnqueueThrows:v=>enqueueThrows=v,setSendThrows:v=>sendThrows=v};
 }
 test('concurrent duplicate selection uses one job and collapses child selections',async()=>{
@@ -29,29 +30,48 @@ test('completed native turn without verified content retains the trigger tag',as
   const f=await fixture();await f.runtime.submitRule({requestId:'req',kbId:'kb',ruleId:'any-rule',remIds:['root']});
   await f.runtime.tick({scan:false});assert.equal(f.writes.length,1);assert.equal((await f.runtime.state()).jobs[0].status,'awaiting-input');
 });
-test('unknown WakeWire acceptance recovers with the same idempotency key',async()=>{
+test('lost native creation response never creates another Thread on polling or retry',async()=>{
   const f=await fixture();f.setEnqueueThrows(true);
-  const job=await f.runtime.chat({requestId:'req',kbId:'kb',text:'Do work'});assert.equal(job.status,'acceptance-unknown');
-  f.deliveries.set(job.id,{id:job.id,threadId:'native'});await f.runtime.tick({scan:false});
-  const state=await f.runtime.state();assert.equal(state.jobs.length,1);assert.equal(state.jobs[0].threadId,'native');assert.equal(state.jobs[0].visible,true);
+  const job=await f.runtime.chat({requestId:'req',kbId:'kb',text:'Do work'});assert.equal(job.status,'creation-unknown');
+  await f.runtime.tick({scan:false});await f.runtime.chat({requestId:'req',kbId:'kb',text:'Do work'});
+  const state=await f.runtime.state();assert.equal(state.jobs.length,1);assert.equal(state.jobs[0].threadId,undefined);assert.equal(f.deliveries.size,1);assert.equal(f.sends.length,0);
 });
 test('unknown native follow-up is held, not resent on retry or restart',async()=>{
   const f=await fixture();const job=await f.runtime.chat({requestId:'new',kbId:'kb',text:'Hello'});f.setSendThrows(true);
   const data={requestId:'follow',kbId:'kb',text:'Continue'};
   assert.equal((await f.runtime.followup(job.id,data)).status,'unknown');await f.runtime.followup(job.id,data);
-  await assert.rejects(f.runtime.followup(job.id,{...data,requestId:'other'}),/结果未确认/);assert.equal(f.sends.length,1);
+  await assert.rejects(f.runtime.followup(job.id,{...data,requestId:'other'}),/结果未确认/);assert.equal(f.sends.length,2);
+});
+test('invalid attachments do not create an uncertain sending record',async()=>{
+  const f=await fixture(),job=await f.runtime.chat({requestId:'new',kbId:'kb',text:'Hello'});
+  await assert.rejects(f.runtime.followup(job.id,{requestId:'missing-image',kbId:'kb',text:'Continue',attachmentIds:['missing']}));
+  assert.equal((await f.runtime.state()).attempts['missing-image'],undefined);
+  assert.equal((await f.runtime.followup(job.id,{requestId:'valid',kbId:'kb',text:'Continue'})).status,'accepted');
+});
+test('definitive native fork rejection is failed, not unknown acceptance',async()=>{
+  const f=await fixture(),job=await f.runtime.chat({requestId:'new',kbId:'kb',text:'Hello'});
+  f.runtime.native.fork=async()=>{throw new NativeRpcError('Thread is active',{code:-32600});};
+  assert.equal((await f.runtime.fork(job.id,{requestId:'fork',kbId:'kb'})).status,'failed');
 });
 test('native renderer excludes reasoning and raw tool content and preserves chronological turns',()=>{
   const s={turns:[{id:'2',items:[{id:'b',type:'agentMessage',text:'second'}]},{id:'1',items:[{id:'u',type:'userMessage',content:[{type:'text',text:'first'}]},{type:'reasoning',summary:'private'},{type:'commandExecution',command:'secret'}]}]};
   assert.deepEqual(messagesFromNative(s).map(m=>m.content),['first','second']);
 });
-test('native cross-Thread prompts render and recover through the official delegation output only',async()=>{
+test('delegation outputs cannot masquerade as user input or confirm unknown native sends',async()=>{
   const f=await fixture(),job=await f.runtime.chat({requestId:'initial',kbId:'kb',text:'First'});f.setSendThrows(true);
   await f.runtime.followup(job.id,{requestId:'uncertain',kbId:'kb',text:'More'});
-  const prompt=f.sends[0][1],item={type:'functionCallOutput',id:'input',namespace:'codex_app',name:'send_message_to_thread',output:{text:'<codex_delegation>\n<source_thread_id>owner</source_thread_id>\n<input>'+prompt+'</input>\n</codex_delegation>',truncated:false}};
+  const prompt=f.sends[1][1],item={type:'functionCallOutput',id:'input',namespace:'codex_app',name:'send_message_to_thread',output:{text:'<codex_delegation>\n<source_thread_id>owner</source_thread_id>\n<input>'+prompt+'</input>\n</codex_delegation>',truncated:false}};
   const snapshot={thread:{status:{type:'idle'}},turns:[{id:'new-turn',status:'completed',items:[item,{...item,id:'other',namespace:'untrusted'}]}]};
-  assert.equal(messagesFromNative(snapshot).length,1);assert.equal(messagesFromNative(snapshot)[0].content,prompt);
-  f.runtime.native.read=async()=>snapshot;await f.runtime.tick({scan:false});assert.equal((await f.runtime.state()).attempts.uncertain.status,'accepted');assert.equal(f.sends.length,1);
+  assert.equal(messagesFromNative(snapshot).length,0);
+  f.runtime.native.read=async()=>snapshot;await f.runtime.tick({scan:false});assert.equal((await f.runtime.state()).attempts.uncertain.status,'unknown');
+  snapshot.turns[0].items.push({id:'user',type:'userMessage',content:[{type:'text',text:prompt}]});
+  await f.runtime.tick({scan:false});assert.equal((await f.runtime.state()).attempts.uncertain.status,'accepted');assert.equal(f.sends.length,2);
+});
+test('lost first turn response recovers from raw native history without replay',async()=>{
+  const f=await fixture();f.setSendThrows(true);
+  const job=await f.runtime.chat({requestId:'initial',kbId:'kb',text:'First'});assert.equal(job.status,'acceptance-unknown');assert.equal(job.threadId,'native');
+  f.runtime.native.read=async()=>({thread:{status:{type:'idle'}},turns:[{id:'first',status:'completed',items:[{type:'userMessage',content:[{type:'text',text:f.sends[0][1]}]}]}]});
+  await f.runtime.tick({scan:false});assert.equal((await f.runtime.state()).jobs[0].status,'ready');assert.equal(f.sends.length,1);
 });
 function trees(){const n={remId:'root',title:'Instruction',parentRemId:'doc',children:[],remType:'text',cardDirection:null,tags:['start'],inlineRefs:[],media:[]};return {before:{rootId:'root',nodes:{root:n}},after:{rootId:'root',nodes:{root:{...n,title:'Answer'}}},result:{version:1,rootId:'root',expectedNodes:[{remId:'root',title:'Answer',parentRemId:'doc'}],consumedInstructionIds:[]},read:async()=>{},trashRemId:'trash'};}
 test('receipt is independently checked against live content and protected structure',async()=>{

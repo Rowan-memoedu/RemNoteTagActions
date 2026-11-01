@@ -4,7 +4,7 @@ import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {loadConfig} from '../src/config.mjs';
 import {jsonRead,jsonWrite} from '../src/io.mjs';
-const config=await loadConfig(),evidence=join(config.artifactsRoot,'visible-canary');
+const config=await loadConfig(),evidence=join(config.artifactsRoot,'native-session-canary');
 await mkdir(evidence,{recursive:true});
 const {token}=await jsonRead(join(config.dataRoot,'transport.json'));
 const api=async(path,data)=>{const r=await fetch('http://127.0.0.1:43171'+path,{method:data?'POST':'GET',headers:{Authorization:'Bearer '+token,...(data?{'Content-Type':'application/json'}:{})},...(data?{body:JSON.stringify(data)}:{}),signal:AbortSignal.timeout(90000)});const b=await r.json();if(!r.ok)throw Error(b.error);return b;};

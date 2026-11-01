@@ -21,7 +21,7 @@ declareIndexPlugin(async plugin=>{
   }
   const report=async()=>{try{
     for(const action of actions)if(!await plugin.rem.findOne(action.triggerTagId))throw Error('请切回绑定的知识库');
-    await request('/api/plugin',{version:'0.2.0',commands,headerRegistered:true,sidebarRegistered:true,kbId:(await plugin.kb.getCurrentKnowledgeBaseData())._id});
+    await request('/api/plugin',{version:'0.3.0',commands,headerRegistered:true,sidebarRegistered:true,kbId:(await plugin.kb.getCurrentKnowledgeBaseData())._id});
   }catch(e){await plugin.storage.setSession('tag-actions.connectionError',e.message);}};
   await report();heartbeat=setInterval(report,20000);
 },async plugin=>{clearInterval(heartbeat);await plugin.app.unregisterWidget('header',WidgetLocation.PaneHeader);await plugin.app.unregisterWidget('menu',WidgetLocation.Popup);await plugin.app.unregisterWidget('sidebar',WidgetLocation.RightSidebar);});

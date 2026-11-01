@@ -21,7 +21,7 @@ export async function serve(runtime,{port=runtime.config.port??43171,startPollin
   let credentials=await jsonRead(credentialsPath,null);
   if(!credentials){credentials={token:randomBytes(32).toString('hex')};await jsonWrite(credentialsPath,credentials);}
   const {token}=credentials;let busy=false,lastError=null;
-  async function tick(){if(busy)return;busy=true;try{if(!runtime.wakewire.routeId)await runtime.ready();await runtime.tick();lastError=null;}catch(e){lastError=e.message;runtime.log('bridge: '+e.message);}finally{busy=false;}}
+  async function tick(){if(busy)return;busy=true;try{if(!runtime.isReady)await runtime.ready();await runtime.tick();lastError=null;}catch(e){lastError=e.message;runtime.log('bridge: '+e.message);}finally{busy=false;}}
   const respond=(res,status,value,headers={})=>{res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff',...headers});res.end(status===204?undefined:JSON.stringify(value));};
   async function body(req) {
     if(!req.headers['content-type']?.startsWith('application/json'))throw Error('JSON body required');
@@ -36,7 +36,7 @@ export async function serve(runtime,{port=runtime.config.port??43171,startPollin
       const url=new URL(req.url,'http://localhost'),path=url.pathname,api=path.startsWith('/api/');
       if(api&&origin&&!allowedOrigins.includes(origin))return respond(res,403,{error:'Origin rejected'});
       if(api&&req.method==='OPTIONS')return respond(res,204,null,{...cors,'Access-Control-Allow-Methods':'GET,POST,OPTIONS','Access-Control-Allow-Headers':'Authorization,Content-Type'});
-      if(path==='/health')return respond(res,200,{app:'RemNoteTagActions',version:'0.2.0',busy,bridgeError:lastError});
+      if(path==='/health')return respond(res,200,{app:'RemNoteTagActions',version:'0.3.0',busy,bridgeError:lastError});
       if(api&&!authorized(req,token))return respond(res,401,{error:'Unauthorized'},cors);
       if(path==='/api/actions'&&req.method==='GET')return respond(res,200,{actions:config.rules.filter(r=>r.enabled!==false).map(r=>({id:r.id,label:r.label,triggerTagId:r.triggerTagId,shortcut:r.shortcut})),capabilities:runtime.capabilities},cors);
       if(path==='/api/status'&&req.method==='GET')return respond(res,200,{...await runtime.state(),capabilities:runtime.capabilities,bridgeError:lastError},cors);
@@ -52,11 +52,13 @@ export async function serve(runtime,{port=runtime.config.port??43171,startPollin
         await writeFile(metadata.path,bytes,{flag:'wx'});await jsonWrite(join(dir,imageId+'.json'),metadata);
         return respond(res,201,{id:imageId,name:metadata.name,size:metadata.size},cors);
       }
-      const chat=path.match(/^\/api\/chats\/([\w-]+)(?:\/(messages|fork))?$/);
+      const chat=path.match(/^\/api\/chats\/([\w-]+)(?:\/(messages|fork|stop|responses))?$/);
       if(chat){
         if(!chat[2]&&req.method==='GET')return respond(res,200,await runtime.thread(chat[1],url.searchParams.get('cursor')),cors);
         if(chat[2]==='messages'&&req.method==='POST')return respond(res,202,await runtime.followup(chat[1],await body(req)),cors);
         if(chat[2]==='fork'&&req.method==='POST')return respond(res,202,await runtime.fork(chat[1],await body(req)),cors);
+        if(chat[2]==='stop'&&req.method==='POST')return respond(res,202,await runtime.stop(chat[1],await body(req)),cors);
+        if(chat[2]==='responses'&&req.method==='POST')return respond(res,200,await runtime.respond(chat[1],await body(req)),cors);
       }
       if(api)return respond(res,404,{error:'Unknown API route'},cors);
       const files={'/':'index.html','/index.html':'index.html','/manifest.json':'manifest.json','/index.js':'index.js','/header.js':'header.js','/menu.js':'menu.js','/sidebar.js':'sidebar.js','/icon.svg':'icon.svg','/chat.svg':'chat.svg'};
@@ -76,6 +78,6 @@ export async function serve(runtime,{port=runtime.config.port??43171,startPollin
   let server6;
   if(ipv6){server6=http.createServer(handler);try{await new Promise((resolve,reject)=>{server6.once('error',reject);server6.listen(port,'::1',resolve);});}catch(e){server.close();throw e;}}
   const timer=startPolling?setInterval(()=>void tick(),config.pollMs):null;if(startPolling)void tick();
-  await jsonWrite(join(config.dataRoot,'service.json'),{pid:process.pid,port,startedAt:new Date().toISOString(),version:'0.2.0'});
+  await jsonWrite(join(config.dataRoot,'service.json'),{pid:process.pid,port,startedAt:new Date().toISOString(),version:'0.3.0'});
   return {server,close:async()=>{clearInterval(timer);await Promise.all([server,server6].filter(Boolean).map(s=>new Promise(r=>s.close(r))));}};
 }
