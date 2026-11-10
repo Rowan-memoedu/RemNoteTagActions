@@ -2,7 +2,6 @@
 
 协作开发、Agent 提交与合并规则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-
 RemNote 原生插件：标签生成和右侧助手均通过既有 WakeWire 的独立工作流接口建立 ChatGPT 桌面端中的 Codex 可见 Thread，使用保存的 Project 的 local 环境。原生 `thread/start` 和 `turn/start` 直接执行用户请求，不通过另一个 chat 转发，不调用 Codex exec。
 
 ## 使用方式
