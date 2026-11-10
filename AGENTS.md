@@ -1,5 +1,8 @@
 # RemNote Tag Actions
 
+- 代码提交、PR 合并、同步与共享边界遵守 [CONTRIBUTING.md](CONTRIBUTING.md)。历史任务授权、私人账号及生产数据权限不随源码共享转移给其他成员或 Agent。
+
+
 - Own this independent plugin and backend only. Preserve peers and the legacy workspace.
 - All RemNote content access uses the existing local MCP endpoint. No browser access to notes.
 - Both workflows use WakeWire's independent codex-session transport and official native thread/start and turn/start in the saved local Project at D:/Workspaces/新建文件夹. Do not use an owner Thread, app-tools create_thread/send_message_to_thread, codex_delegation, Codex exec, or a direct-Codex fallback. UI visibility alone is insufficient: verify raw userMessage input and independent origin. Runtime reads native history; release acceptance also checks the desktop's official list_threads/read_thread tools.
